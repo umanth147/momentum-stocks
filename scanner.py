@@ -5,20 +5,19 @@ import pytz
 import requests
 import yfinance as yf
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# முன்னணி Liquid F&O பங்குகள் (.NS suffix கட்டாயம்)
+# Active NSE F&O / Liquid stocks (.NS suffix)
 FNO_STOCKS = [
     "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "TCS.NS",
     "SBIN.NS", "AXISBANK.NS", "KOTAKBANK.NS", "LT.NS", "ITC.NS",
-    "BHARTIARTL.NS", "M&M.NS", "TATAMOTORS.NS", "SUNPHARMA.NS", "HCLTECH.NS",
+    "BHARTIARTL.NS", "M&M.NS", "SUNPHARMA.NS", "HCLTECH.NS",
     "BAJFINANCE.NS", "TATASTEEL.NS", "MARUTI.NS", "WIPRO.NS", "ADANIENT.NS",
     "ASIANPAINT.NS", "TITAN.NS", "ULTRACEMCO.NS", "POWERGRID.NS", "NTPC.NS"
 ]
 
-# தேவைக்கேற்ப அளவுகோல்களை மாற்றிக்கொள்ளலாம்
-VOLUME_MULTIPLIER = 1.3   # தற்போதைய கேண்டில் வால்யூம் >= சராசரி வால்யூம் * 1.3
+VOLUME_MULTIPLIER = 1.3
 
 
 def get_ist_now() -> datetime:
@@ -26,6 +25,12 @@ def get_ist_now() -> datetime:
 
 
 def send_telegram(message: str) -> None:
+    if not BOT_TOKEN or not CHAT_ID:
+        raise ValueError(
+            "TELEGRAM_BOT_TOKEN அல்லது TELEGRAM_CHAT_ID காலியாக உள்ளது. "
+            "GitHub Repository -> Settings -> Secrets and variables -> Actions இல் சரிபார்க்கவும்."
+        )
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -40,7 +45,6 @@ def send_telegram(message: str) -> None:
 def compute_vwap(df: pd.DataFrame) -> pd.Series:
     typical_price = (df["High"] + df["Low"] + df["Close"]) / 3.0
     cum_volume = df["Volume"].cumsum()
-    # Volume 0 ஆக இருந்தால் division error வராமல் தவிர்க்க
     cum_volume_safe = cum_volume.replace(0, float("nan"))
     cum_pv = (typical_price * df["Volume"]).cumsum()
     return cum_pv / cum_volume_safe
@@ -64,7 +68,6 @@ def scan_fno_stocks() -> None:
             if df is None or df.empty or len(df) < 3:
                 continue
 
-            # புதிய yfinance பதிப்புகளில் MultiIndex columns வந்தால் ஒற்றை நிலைக்கு மாற்ற
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
@@ -72,12 +75,10 @@ def scan_fno_stocks() -> None:
             if len(df) < 3:
                 continue
 
-            # முதல் 3 ஐந்து-நிமிட கேண்டில்கள் (9:15 - 9:30 AM Opening Range)
             orb_df = df.iloc[:3]
             orb_high = float(orb_df["High"].max())
             orb_low = float(orb_df["Low"].min())
 
-            # VWAP கணக்கீடு
             df["VWAP"] = compute_vwap(df)
 
             latest = df.iloc[-1]
@@ -90,15 +91,12 @@ def scan_fno_stocks() -> None:
 
             clean_name = symbol.replace(".NS", "")
 
-            # Bullish: LTP > ORB High + LTP > VWAP + Volume Surge
             if ltp > orb_high and ltp > vwap_val and vol_ratio >= VOLUME_MULTIPLIER:
                 bullish_signals.append(
                     f"🟢 <b>{clean_name}</b>\n"
                     f"   LTP: ₹{ltp:.2f} | VWAP: ₹{vwap_val:.2f}\n"
                     f"   ORB High: ₹{orb_high:.2f} | Vol: {vol_ratio:.1f}x"
                 )
-
-            # Bearish: LTP < ORB Low + LTP < VWAP + Volume Surge
             elif ltp < orb_low and ltp < vwap_val and vol_ratio >= VOLUME_MULTIPLIER:
                 bearish_signals.append(
                     f"🔴 <b>{clean_name}</b>\n"
@@ -111,7 +109,7 @@ def scan_fno_stocks() -> None:
 
     date_str = now_ist.strftime("%d-%b-%Y %I:%M %p IST")
     lines = [
-        f"📌 <b>F&O Intraday Scan (ORB + VWAP + Vol)</b>",
+        "📌 <b>F&O Intraday Scan (ORB + VWAP + Vol)</b>",
         f"🕒 {date_str}",
         ""
     ]
@@ -127,7 +125,7 @@ def scan_fno_stocks() -> None:
         lines.append("")
 
     if not bullish_signals and not bearish_signals:
-        lines.append("இன்றைய 9:30 AM ஸ்கேனில் ORB + VWAP + Volume நிபந்தனைகளுக்கு ஏற்ப சிக்னல்கள் எதுவும் வரவில்லை.")
+        lines.append("இன்றைய ஸ்கேனில் ORB + VWAP + Volume நிபந்தனைகளுக்கு ஏற்ப சிக்னல்கள் எதுவும் வரவில்லை.")
 
     final_message = "\n".join(lines).strip()
     send_telegram(final_message)
