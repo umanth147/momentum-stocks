@@ -8,7 +8,6 @@ import yfinance as yf
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# All 218 F&O symbols formatted with .NS suffix for NSE on Yahoo Finance
 RAW_FNO_SYMBOLS = [
     "360ONE", "ABB", "APLAPOLLO", "AUBANK", "ACUTAAS",
     "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS", "ADANIPOWER",
@@ -57,8 +56,6 @@ RAW_FNO_SYMBOLS = [
 ]
 
 FNO_STOCKS = [f"{s.strip()}.NS" for s in dict.fromkeys(RAW_FNO_SYMBOLS) if s.strip()]
-
-VOLUME_MULTIPLIER = 1.3
 BATCH_SIZE = 55
 
 
@@ -68,14 +65,22 @@ def get_ist_now() -> datetime:
 
 def send_telegram(message: str) -> None:
     if not BOT_TOKEN or not CHAT_ID:
-        raise ValueError(
-            "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in GitHub Secrets."
-        )
+        raise ValueError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in GitHub Secrets.")
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    # Telegram hard limit is 4096 characters per message
-    max_len = 3900
-    chunks = [message[i:i + max_len] for i in range(0, len(message), max_len)] or [message]
+    max_len = 3800
+    lines = message.split("\n")
+    chunks = []
+    current = ""
+
+    for line in lines:
+        if len(current) + len(line) + 1 > max_len:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
 
     for chunk in chunks:
         payload = {
@@ -96,12 +101,12 @@ def compute_vwap(df: pd.DataFrame) -> pd.Series:
     return cum_pv / cum_volume_safe
 
 
-def evaluate_stock_df(symbol: str, stock_df: pd.DataFrame):
+def classify_stock(symbol: str, stock_df: pd.DataFrame):
     df = stock_df.dropna(subset=["High", "Low", "Close", "Volume"]).copy()
     if df.empty or len(df) < 3:
         return None
 
-    # First three 5-min candles (~9:15 AM to 9:30 AM opening range)
+    # முதல் 3 ஐந்து-நிமிட கேண்டில்கள் (9:15 - 9:30 AM Opening Range)
     orb_df = df.iloc[:3]
     orb_high = float(orb_df["High"].max())
     orb_low = float(orb_df["Low"].min())
@@ -118,29 +123,63 @@ def evaluate_stock_df(symbol: str, stock_df: pd.DataFrame):
 
     clean_name = symbol.replace(".NS", "")
 
-    if ltp > orb_high and ltp > vwap_val and vol_ratio >= VOLUME_MULTIPLIER:
-        return (
-            "bullish",
-            f"🟢 <b>{clean_name}</b>\n"
-            f"   LTP: ₹{ltp:.2f} | VWAP: ₹{vwap_val:.2f}\n"
-            f"   ORB High: ₹{orb_high:.2f} | Vol: {vol_ratio:.1f}x"
-        )
+    # Bullish அல்லது Bearish திசை மற்றும் பிரேக்அவுட் சதவீதம்
+    is_bullish = ltp > orb_high and ltp > vwap_val
+    is_bearish = ltp < orb_low and ltp < vwap_val
 
-    if ltp < orb_low and ltp < vwap_val and vol_ratio >= VOLUME_MULTIPLIER:
-        return (
-            "bearish",
-            f"🔴 <b>{clean_name}</b>\n"
-            f"   LTP: ₹{ltp:.2f} | VWAP: ₹{vwap_val:.2f}\n"
-            f"   ORB Low: ₹{orb_low:.2f} | Vol: {vol_ratio:.1f}x"
-        )
+    if is_bullish:
+        side = "🟢 BUY"
+        breakout_pct = ((ltp - orb_high) / orb_high) * 100.0 if orb_high > 0 else 0.0
+    elif is_bearish:
+        side = "🔴 SELL"
+        breakout_pct = ((orb_low - ltp) / orb_low) * 100.0 if orb_low > 0 else 0.0
+    else:
+        side = "⚪ RANGE"
+        breakout_pct = 0.0
 
-    return None
+    info = {
+        "name": clean_name,
+        "side": side,
+        "ltp": ltp,
+        "vwap": vwap_val,
+        "vol_ratio": vol_ratio,
+        "breakout_pct": breakout_pct
+    }
+
+    # 4 நிலைகளாகப் பிரித்தல்
+    if (is_bullish or is_bearish) and vol_ratio >= 2.0 and breakout_pct >= 0.5:
+        tier = "very_good"
+    elif (is_bullish or is_bearish) and vol_ratio >= 1.5:
+        tier = "good"
+    elif (is_bullish or is_bearish) and vol_ratio >= 1.1:
+        tier = "medium"
+    else:
+        tier = "low"
+
+    return tier, info
+
+
+def format_item(item: dict, compact: bool = False) -> str:
+    if compact:
+        return (
+            f"• <b>{item['name']}</b> ({item['side']}) | "
+            f"₹{item['ltp']:.1f} | Vol: {item['vol_ratio']:.1f}x"
+        )
+    return (
+        f"{item['side']} <b>{item['name']}</b> — "
+        f"LTP: ₹{item['ltp']:.2f} | VWAP: ₹{item['vwap']:.2f} | "
+        f"Move: {item['breakout_pct']:.2f}% | Vol: <b>{item['vol_ratio']:.1f}x</b>"
+    )
 
 
 def scan_fno_stocks() -> None:
     now_ist = get_ist_now()
-    bullish_signals = []
-    bearish_signals = []
+    buckets = {
+        "very_good": [],
+        "good": [],
+        "medium": [],
+        "low": []
+    }
 
     for i in range(0, len(FNO_STOCKS), BATCH_SIZE):
         batch = FNO_STOCKS[i:i + BATCH_SIZE]
@@ -166,41 +205,58 @@ def scan_fno_stocks() -> None:
                     else:
                         stock_df = data
 
-                    result = evaluate_stock_df(symbol, stock_df)
-                    if result:
-                        direction, formatted = result
-                        if direction == "bullish":
-                            bullish_signals.append(formatted)
-                        else:
-                            bearish_signals.append(formatted)
+                    res = classify_stock(symbol, stock_df)
+                    if res:
+                        tier, info = res
+                        buckets[tier].append(info)
                 except Exception as sym_err:
-                    print(f"[SYMBOL SKIP] {symbol}: {sym_err}")
-
+                    print(f"[SKIP] {symbol}: {sym_err}")
         except Exception as batch_err:
-            print(f"[BATCH ERROR] {batch[0]}..{batch[-1]}: {batch_err}")
+            print(f"[BATCH ERROR] {batch_err}")
+
+    # அதிக வால்யூம் அடிப்படையில் வரிசைப்படுத்தல்
+    for key in buckets:
+        buckets[key].sort(key=lambda x: x["vol_ratio"], reverse=True)
 
     date_str = now_ist.strftime("%d-%b-%Y %I:%M %p IST")
     lines = [
-        f"📌 <b>F&O Intraday Scan ({len(FNO_STOCKS)} Stocks)</b>",
+        f"📊 <b>F&O Momentum Tier Report ({len(FNO_STOCKS)} Stocks)</b>",
         f"🕒 {date_str}",
         ""
     ]
 
-    if bullish_signals:
-        lines.append(f"<b>📈 Bullish Setups ({len(bullish_signals)}):</b>")
-        lines.extend(bullish_signals)
-        lines.append("")
+    # 1. Very Good Momentum
+    lines.append(f"<b>1️⃣ VERY GOOD MOMENTUM ({len(buckets['very_good'])})</b>")
+    if buckets["very_good"]:
+        lines.extend(format_item(x) for x in buckets["very_good"][:15])
+    else:
+        lines.append("• இல்லை (None)")
+    lines.append("")
 
-    if bearish_signals:
-        lines.append(f"<b>📉 Bearish Setups ({len(bearish_signals)}):</b>")
-        lines.extend(bearish_signals)
-        lines.append("")
+    # 2. Good Momentum
+    lines.append(f"<b>2️⃣ GOOD MOMENTUM ({len(buckets['good'])})</b>")
+    if buckets["good"]:
+        lines.extend(format_item(x) for x in buckets["good"][:15])
+    else:
+        lines.append("• இல்லை (None)")
+    lines.append("")
 
-    if not bullish_signals and not bearish_signals:
-        lines.append("No qualifying ORB + VWAP + Volume signals found in this scan.")
+    # 3. Medium Momentum
+    lines.append(f"<b>3️⃣ MEDIUM MOMENTUM ({len(buckets['medium'])})</b>")
+    if buckets["medium"]:
+        lines.extend(format_item(x, compact=True) for x in buckets["medium"][:15])
+    else:
+        lines.append("• இல்லை (None)")
+    lines.append("")
 
-    final_message = "\n".join(lines).strip()
-    send_telegram(final_message)
+    # 4. Low Momentum (Top 10 by Volume only to avoid message spam)
+    lines.append(f"<b>4️⃣ LOW MOMENTUM (Total: {len(buckets['low'])} | Top 10 Vol)</b>")
+    if buckets["low"]:
+        lines.extend(format_item(x, compact=True) for x in buckets["low"][:10])
+    else:
+        lines.append("• இல்லை (None)")
+
+    send_telegram("\n".join(lines).strip())
 
 
 if __name__ == "__main__":
